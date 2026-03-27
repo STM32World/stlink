@@ -67,9 +67,164 @@ static bool stlink_fread_ihex_worker(void *, uint8_t *, ssize_t);
 static bool stlink_fread_ihex_finalize(struct stlink_fread_ihex_worker_arg *);
 
 static bool stlink_fread_worker(void *, uint8_t *, ssize_t);
+static inline bool stlink_is_cm33_core(const stlink_t *sl);
+static inline bool stlink_h5_dbgmcu_probe_looks_like_h5(const cortex_m3_cpuid_t *cpu_id,
+                                                        uint32_t dbgmcu_idcode);
+static int32_t stlink_h5_try_connect_under_reset(stlink_t *sl);
+static inline void stlink_h5_enable_ap1_mode(stlink_t *sl);
+static inline void stlink_h5_mark_attached(stlink_t *sl);
+static inline void stlink_h5_reset_state(stlink_t *sl, uint8_t target_ap);
+static int32_t stlink_h5_wait_core_regs_ready(stlink_t *sl, uint32_t *last_dhcsr);
 
 
 /* === Definition of private structs and functions from stlink.h === */
+
+static inline bool stlink_is_cm33_core(const stlink_t *sl) {
+  return sl->core_id == STM32_CORE_ID_M7F_M33_SWD ||
+         sl->core_id == STM32_CORE_ID_M7F_M33_JTAG;
+}
+
+static inline bool stlink_h5_dbgmcu_probe_looks_like_h5(const cortex_m3_cpuid_t *cpu_id,
+                                                        uint32_t dbgmcu_idcode) {
+  return cpu_id->part == STM32_REG_CMx_CPUID_PARTNO_CM33 &&
+         dbgmcu_idcode == 0;
+}
+
+static inline void stlink_h5_enable_ap1_mode(stlink_t *sl) {
+  sl->h5_ap1_mode = true;
+  sl->target_ap = 1;
+}
+
+static inline void stlink_h5_mark_attached(stlink_t *sl) {
+  stlink_h5_enable_ap1_mode(sl);
+  sl->h5_native_debug_regs = true;
+  sl->h5_native_core_regs = true;
+}
+
+static inline void stlink_h5_reset_state(stlink_t *sl, uint8_t target_ap) {
+  sl->target_ap = target_ap;
+  stlink_invalidate_ap_session(sl);
+  sl->h5_ap1_mode = false;
+  sl->h5_native_debug_regs = false;
+  sl->h5_native_core_regs = false;
+}
+
+static int32_t stlink_h5_wait_core_regs_ready(stlink_t *sl, uint32_t *last_dhcsr) {
+  uint32_t dhcsr = 0;
+  uint32_t timeout = time_ms() + 100;
+
+  while(time_ms() < timeout) {
+    if(stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr) == -1) {
+      return (-1);
+    }
+
+    if((dhcsr & (STM32_REG_DHCSR_S_HALT | STM32_REG_DHCSR_S_REGRDY)) ==
+       (STM32_REG_DHCSR_S_HALT | STM32_REG_DHCSR_S_REGRDY)) {
+      if(last_dhcsr != NULL) {
+        *last_dhcsr = dhcsr;
+      }
+      return (0);
+    }
+
+    usleep(1000);
+  }
+
+  if(last_dhcsr != NULL) {
+    *last_dhcsr = dhcsr;
+  }
+
+  return (-1);
+}
+
+static int32_t stlink_h5_try_connect_under_reset(stlink_t *sl) {
+  cortex_m3_cpuid_t cpu_id;
+  uint32_t dbgmcu_idcode = 0;
+  uint32_t dhcsr = 0;
+  uint32_t timeout;
+  uint8_t original_target_ap = sl->target_ap;
+  const uint32_t halt_req = STM32_REG_DHCSR_DBGKEY |
+                            STM32_REG_DHCSR_C_HALT |
+                            STM32_REG_DHCSR_C_DEBUGEN;
+
+  if(stlink_enter_swd_mode(sl) == 0 &&
+     stlink_core_id(sl) == 0 &&
+     stlink_is_cm33_core(sl) &&
+     stlink_cpu_id(sl, &cpu_id) == 0 &&
+     stlink_read_debug32(sl, 0xE0044000, &dbgmcu_idcode) == 0 &&
+     stlink_h5_dbgmcu_probe_looks_like_h5(&cpu_id, dbgmcu_idcode)) {
+    /*
+     * H5 attach runs under reset through AP1. Keep NRST asserted while
+     * entering SWD, initialize AP1, arm halt/debug, then release reset and
+     * poll DHCSR until the core halts.
+     */
+    stlink_h5_enable_ap1_mode(sl);
+
+    stlink_invalidate_ap_session(sl);
+    sl->h5_native_debug_regs = true;
+    sl->h5_native_core_regs = false;
+
+    if(stlink_write_debug32(sl, STM32_REG_DHCSR, halt_req) != 0) {
+      sl->h5_native_debug_regs = false;
+      stlink_h5_reset_state(sl, original_target_ap);
+      return (-1);
+    }
+
+    if(stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr)) {
+      sl->h5_native_debug_regs = false;
+      stlink_h5_reset_state(sl, original_target_ap);
+      return (-1);
+    }
+
+    if(stlink_write_debug32(sl, STM32_REG_CM3_DEMCR,
+                            STM32_REG_CM3_DEMCR_VC_CORERESET)) {
+      sl->h5_native_debug_regs = false;
+      stlink_h5_reset_state(sl, original_target_ap);
+      return (-1);
+    }
+
+    if(stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr)) {
+      sl->h5_native_debug_regs = false;
+      stlink_h5_reset_state(sl, original_target_ap);
+      return (-1);
+    }
+
+    // minimum reset pulse duration of 20 us (RM0008, 8.1.2 Power reset)
+    usleep(20);
+
+    if(stlink_jtag_reset(sl, STLINK_DEBUG_APIV2_DRIVE_NRST_HIGH)) {
+      sl->h5_native_debug_regs = false;
+      stlink_h5_reset_state(sl, original_target_ap);
+      return (-1);
+    }
+
+    timeout = time_ms() + 100;
+    while(time_ms() < timeout) {
+      if(stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr)) {
+        sl->h5_native_debug_regs = false;
+        stlink_h5_reset_state(sl, original_target_ap);
+        return (-1);
+      }
+
+      if((dhcsr & STM32_REG_DHCSR_S_HALT) &&
+         (dhcsr & STM32_REG_DHCSR_S_RESET_ST) == 0) {
+        sl->core_stat = TARGET_HALTED;
+        stlink_h5_mark_attached(sl);
+        stop_wdg_in_debug(sl);
+        return (0);
+      }
+
+      usleep(1000);
+    }
+
+    WLOG("H5 connect-under-reset did not halt the core (DHCSR=0x%08x)\n", dhcsr);
+    sl->h5_native_debug_regs = false;
+    stlink_h5_reset_state(sl, original_target_ap);
+    return (-1);
+  }
+
+  stlink_h5_reset_state(sl, original_target_ap);
+  return (-1);
+}
 
 static void stop_wdg_in_debug(stlink_t *sl) {
   uint32_t dbgmcu_cr;
@@ -107,6 +262,13 @@ static void stop_wdg_in_debug(stlink_t *sl) {
     dbgmcu_cr = STM32H7_DBGMCU_APB1HFZ;
     set = (1 << STM32H7_DBGMCU_APB1HFZ_IWDG_STOP);
     break;
+  case STM32_FLASH_TYPE_H5:
+    dbgmcu_cr = STM32H5_DBGMCU_APB1FZR1;
+    set = (1 << STM32H5_DBGMCU_APB1FZR1_IWDG_STOP) |
+          (1 << STM32H5_DBGMCU_APB1FZR1_WWDG_STOP);
+    break;
+  case STM32_FLASH_TYPE_L5_U5:
+    return;
   case STM32_FLASH_TYPE_WB_WL:
     dbgmcu_cr = STM32WB_DBGMCU_APB1FZR1;
     set = (1 << STM32WB_DBGMCU_APB1FZR1_IWDG_STOP) |
@@ -248,6 +410,14 @@ void _parse_version(stlink_t *sl, stlink_version_t *slv) {
         sl->version.flags |= STLINK_F_HAS_TRACE;
         sl->max_trace_freq = STLINK_V2_MAX_TRACE_FREQUENCY;
       }
+
+      if(sl->version.jtag_v >= 28) {
+        sl->version.flags |= STLINK_F_HAS_AP_INIT;
+      }
+
+      if(sl->version.jtag_v >= 32) {
+        sl->version.flags |= STLINK_F_HAS_DPBANKSEL;
+      }
     }
   } else {
     // V3 uses different version format, for reference see OpenOCD source
@@ -262,7 +432,12 @@ void _parse_version(stlink_t *sl, stlink_version_t *slv) {
     /* preferred API to get last R/W status */
     sl->version.flags |= STLINK_F_HAS_GETLASTRWSTATUS2;
     sl->version.flags |= STLINK_F_HAS_TRACE;
+    sl->version.flags |= STLINK_F_HAS_AP_INIT;
     sl->max_trace_freq = STLINK_V3_MAX_TRACE_FREQUENCY;
+
+    if(sl->version.jtag_v >= 2) {
+      sl->version.flags |= STLINK_F_HAS_DPBANKSEL;
+    }
   }
 
   return;
@@ -317,7 +492,9 @@ static int32_t stlink_read(stlink_t *sl, stm32_addr_t addr, uint32_t size, save_
       aligned_size = (cmp_size + 4) & ~(4 - 1);
     }
 
-    stlink_read_mem32(sl, addr + off, (uint16_t) aligned_size);
+    if(stlink_read_mem32(sl, addr + off, (uint16_t) aligned_size) == -1) {
+      goto on_error;
+    }
 
     if(!fn(fn_arg, sl->q_buf, aligned_size)) {
       goto on_error;
@@ -495,6 +672,13 @@ int32_t stlink_core_id(stlink_t *sl) {
     stlink_print_data(sl);
   }
 
+  if(stlink_is_cm33_core(sl)) {
+    stlink_h5_enable_ap1_mode(sl);
+    if(!sl->h5_native_debug_regs) {
+      stlink_invalidate_ap_session(sl);
+    }
+  }
+
   DLOG("core_id = 0x%08x\n", sl->core_id);
   return (ret);
 }
@@ -561,15 +745,53 @@ int32_t stlink_reset(stlink_t *sl, enum reset_type type) {
 
 int32_t stlink_run(stlink_t *sl, enum run_type type) {
   struct stlink_reg rr;
+  uint32_t dhcsr = 0;
   DLOG("*** stlink_run ***\n");
+
+  if(type == RUN_FLASH_LOADER) {
+    /*
+     * Flash loaders are always Thumb code. Set a known-good xPSR instead of
+     * depending on whatever the target left behind after reset or a fault.
+     */
+    if(stlink_write_reg(sl, 0x01000000, 16) == -1) {
+      return (-1);
+    }
+
+    return (sl->backend->run(sl, type));
+  }
+
+  if(stlink_h5_uses_ap(sl)) {
+    if(stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr) == -1) {
+      return (-1);
+    }
+
+    if((dhcsr & (STM32_REG_DHCSR_S_HALT | STM32_REG_DHCSR_S_REGRDY)) !=
+       (STM32_REG_DHCSR_S_HALT | STM32_REG_DHCSR_S_REGRDY)) {
+      DLOG("H5 RUN_NORMAL forcing halt before core register access (DHCSR=0x%08x)\n",
+           dhcsr);
+      if(stlink_force_debug(sl) == -1) {
+        return (-1);
+      }
+      stlink_h5_mark_attached(sl);
+      if(stlink_h5_wait_core_regs_ready(sl, &dhcsr) == -1) {
+        WLOG("H5 core registers not ready after halt (DHCSR=0x%08x)\n", dhcsr);
+        return (-1);
+      }
+    }
+  }
 
   /* Make sure we are in Thumb mode
    * Cortex-M chips don't support ARM mode instructions
    * xPSR may be incorrect if the vector table has invalid data */
-  stlink_read_reg(sl, 16, &rr);
+  if(stlink_read_reg(sl, 16, &rr) == -1) {
+    return (-1);
+  }
+
   if((rr.xpsr & (1 << 24)) == 0) {
     ILOG("Go to Thumb mode\n");
-    stlink_write_reg(sl, rr.xpsr | (1 << 24), 16);
+    if(stlink_write_reg(sl, rr.xpsr | (1 << 24), 16) == -1) {
+      return (-1);
+    }
   }
 
   return (sl->backend->run(sl, type));
@@ -654,14 +876,41 @@ int32_t stlink_current_mode(stlink_t *sl) {
 
 // Force the core into the debug mode -> halted state.
 int32_t stlink_force_debug(stlink_t *sl) {
+  uint32_t dhcsr = 0;
+
   DLOG("*** stlink_force_debug_mode ***\n");
-  int32_t res = sl->backend->force_debug(sl);
-  if(res) {
-     return (res);
+
+  int32_t res;
+  if(stlink_h5_uses_ap(sl)) {
+    res = stlink_write_debug32(sl, STM32_REG_DHCSR,
+                               STM32_REG_DHCSR_DBGKEY |
+                               STM32_REG_DHCSR_C_HALT |
+                               STM32_REG_DHCSR_C_DEBUGEN);
+  } else {
+    res = sl->backend->force_debug(sl);
   }
-  // Stop the watchdogs in the halted state for suppress target reboot
-  stop_wdg_in_debug(sl);
-  return (0);
+
+  if(res) {
+    return (res);
+  }
+
+  uint32_t timeout = time_ms() + 100;
+  while(time_ms() < timeout) {
+    if(stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr) == -1) {
+      return (-1);
+    }
+
+    if(dhcsr & STM32_REG_DHCSR_S_HALT) {
+      sl->core_stat = TARGET_HALTED;
+      stop_wdg_in_debug(sl);
+      return (0);
+    }
+
+    usleep(1000);
+  }
+
+  ELOG("Failed to halt target after FORCEDEBUG (DHCSR=0x%08x)\n", dhcsr);
+  return (-1);
 }
 
 int32_t stlink_target_voltage(stlink_t *sl) {
@@ -1087,27 +1336,43 @@ int32_t write_buffer_to_sram(stlink_t *sl, flash_loader_t *fl, const uint8_t *bu
   // write the buffer right after the loader, and pad the end with 0xFF if padded_size is larger than size
   int32_t ret = 0;
   uint16_t data_remaining = size;
+  uint16_t off = 0;
   
   if (padded_size < size) {
     padded_size = size;
   }
 
+  /* AP-routed SRAM staging uses 1 KiB WRITEMEM_32BIT chunks. */
+  const uint16_t max_word_chunk = stlink_target_uses_ap(sl) ? 1024 : 512;
   uint16_t word_chunk = padded_size & ~0x3;
   uint16_t byte_chunk = padded_size & 0x3;
 
-  if(word_chunk) {
-    uint16_t data_cnt = word_chunk > data_remaining ? data_remaining : word_chunk;
-    memcpy(sl->q_buf, buf, data_cnt);
-    memset(sl->q_buf + data_cnt, 0xFF, word_chunk - data_cnt);
-    ret = stlink_write_mem32(sl, fl->buf_addr, word_chunk);
+  while(word_chunk && !ret) {
+    uint16_t chunk = word_chunk > max_word_chunk ? max_word_chunk : word_chunk;
+    uint16_t data_cnt = chunk > data_remaining ? data_remaining : chunk;
+
+    memcpy(sl->q_buf, buf + off, data_cnt);
+    memset(sl->q_buf + data_cnt, 0xFF, chunk - data_cnt);
+    ret = stlink_write_mem32(sl, fl->buf_addr + off, chunk);
+    if(ret && stlink_target_uses_ap(sl)) {
+      ELOG("AP%u SRAM stage failed at %#010x (offset %#x, chunk %#x)\n",
+           sl->target_ap, fl->buf_addr + off, off, chunk);
+    }
+
+    word_chunk -= chunk;
+    off += chunk;
     data_remaining -= data_cnt;
   }
 
   if(byte_chunk && !ret) {
     uint16_t data_cnt = byte_chunk > data_remaining ? data_remaining : byte_chunk;
-    memcpy(sl->q_buf, buf + word_chunk, data_cnt);
+    memcpy(sl->q_buf, buf + off, data_cnt);
     memset(sl->q_buf + data_cnt, 0xFF, byte_chunk - data_cnt);
-    ret = stlink_write_mem8(sl, (fl->buf_addr) + word_chunk, byte_chunk);
+    ret = stlink_write_mem8(sl, fl->buf_addr + off, byte_chunk);
+    if(ret && stlink_target_uses_ap(sl)) {
+      ELOG("AP%u SRAM byte stage failed at %#010x (offset %#x, chunk %#x)\n",
+           sl->target_ap, fl->buf_addr + off, off, byte_chunk);
+    }
   }
 
   return (ret);
@@ -1151,6 +1416,7 @@ int32_t stlink_fread(stlink_t *sl, const char *path, bool is_ihex, stm32_addr_t 
 int32_t stlink_chip_id(stlink_t *sl, uint32_t *chip_id) {
   int32_t ret;
   cortex_m3_cpuid_t cpu_id;
+  uint8_t original_target_ap = sl->target_ap;
 
   // Read the CPU ID to determine where to read the core id
   if(stlink_cpu_id(sl, &cpu_id) ||
@@ -1177,7 +1443,7 @@ int32_t stlink_chip_id(stlink_t *sl, uint32_t *chip_id) {
     
     if (*chip_id == 0) {
       // these devices don't have a DBG_IDCODE register
-      // we follow STM32CubeProg and use PART_NUMBER from JTAG_ID instead
+      // use PART_NUMBER from JTAG_ID instead
       // STM32WB05 (RM0491, pg115)
       // STM32WB06/WB07 (RM0530, pg105)
       // STM32WB09 (RM0505, pg167)
@@ -1186,8 +1452,21 @@ int32_t stlink_chip_id(stlink_t *sl, uint32_t *chip_id) {
       *chip_id = (*chip_id) >> STM32WB0_JTAG_PART_NR;
     }
   } else if(cpu_id.part == STM32_REG_CMx_CPUID_PARTNO_CM33) {
-    // STM32L5 (RM0438, pg2157)
+    // STM32L5 (RM0438, pg2157) / STM32U5 (RM0456, pg3085)
+    // H5 returns 0 here because DBGMCU is reached through AP1 rather than AP0.
     ret = stlink_read_debug32(sl, 0xE0044000, chip_id);
+
+    if(ret == 0 && stlink_is_cm33_core(sl) &&
+       stlink_h5_dbgmcu_probe_looks_like_h5(&cpu_id, *chip_id)) {
+      /* Switch the session to AP1-backed H5 access and use the synthetic H5 id. */
+      stlink_h5_enable_ap1_mode(sl);
+      if(!sl->h5_native_debug_regs) {
+        stlink_invalidate_ap_session(sl);
+      }
+      *chip_id = STM32_CHIPID_H5xx;
+      ret = 0;
+      goto on_chip_id_read_done;
+    }
   } else /* СM3, СM4, CM7 */ {
     // default chipid address
 
@@ -1214,6 +1493,11 @@ int32_t stlink_chip_id(stlink_t *sl, uint32_t *chip_id) {
     if(*chip_id == 0x411 && cpu_id.part == STM32_REG_CMx_CPUID_PARTNO_CM4) {
       *chip_id = 0x413;
     }
+  }
+
+on_chip_id_read_done:
+  if(*chip_id != STM32_CHIPID_H5xx) {
+    stlink_h5_reset_state(sl, original_target_ap);
   }
 
   return (ret);
@@ -1247,6 +1531,16 @@ int32_t stlink_load_device_params(stlink_t *sl) {
     WLOG("Invalid flash type, please check device declaration\n");
     sl->flash_size = 0;
     return (0);
+  }
+
+  if(sl->target_ap != params->target_ap) {
+    sl->target_ap = params->target_ap;
+    stlink_invalidate_ap_session(sl);
+  } else if(!stlink_h5_uses_ap(sl)) {
+    stlink_invalidate_ap_session(sl);
+  }
+  if(sl->chip_id == STM32_CHIPID_H5xx) {
+    stlink_h5_enable_ap1_mode(sl);
   }
 
   // These are fixed...
@@ -1353,37 +1647,47 @@ int32_t stlink_load_device_params(stlink_t *sl) {
 
 int32_t stlink_target_connect(stlink_t *sl, enum connect_type connect) {
   if(connect == CONNECT_UNDER_RESET) {
-    stlink_enter_swd_mode(sl);
+    if(stlink_h5_try_connect_under_reset(sl) == 0) {
+      goto connected;
+    } else {
+      /*
+       * Fall back to the generic under-reset path for non-H5 targets or when
+       * the H5-specific attach fails.
+       */
+      stlink_enter_swd_mode(sl);
+      stlink_core_id(sl);
 
-    stlink_jtag_reset(sl, STLINK_DEBUG_APIV2_DRIVE_NRST_LOW);
+      stlink_jtag_reset(sl, STLINK_DEBUG_APIV2_DRIVE_NRST_LOW);
 
-    // try to halt the core before reset
-    // this is useful if the NRST pin is not connected
-    sl->backend->force_debug(sl);
-
-    // minimum reset pulse duration of 20 us (RM0008, 8.1.2 Power reset)
-    usleep(20);
-
-    stlink_jtag_reset(sl, STLINK_DEBUG_APIV2_DRIVE_NRST_HIGH);
-
-    // try to halt the core after reset
-    uint32_t timeout = time_ms() + 10;
-    while (time_ms() < timeout) {
+      // try to halt the core before reset
+      // this is useful if the NRST pin is not connected
       sl->backend->force_debug(sl);
-      usleep(100);
-    }
 
-    // check NRST connection
-    uint32_t dhcsr = 0;
-    stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr);
-    if((dhcsr & STM32_REG_DHCSR_S_RESET_ST) == 0) {
-      WLOG("NRST is not connected\n");
-    }
+      // minimum reset pulse duration of 20 us (RM0008, 8.1.2 Power reset)
+      usleep(20);
 
-    // addition soft reset for halt before the first instruction
-    stlink_soft_reset(sl, 1 /* halt on reset */);
+      stlink_jtag_reset(sl, STLINK_DEBUG_APIV2_DRIVE_NRST_HIGH);
+
+      // try to halt the core after reset
+      uint32_t timeout = time_ms() + 10;
+      while (time_ms() < timeout) {
+        sl->backend->force_debug(sl);
+        usleep(100);
+      }
+
+      // check NRST connection
+      uint32_t dhcsr = 0;
+      stlink_read_debug32(sl, STM32_REG_DHCSR, &dhcsr);
+      if((dhcsr & STM32_REG_DHCSR_S_RESET_ST) == 0) {
+        WLOG("NRST is not connected\n");
+      }
+
+      // addition soft reset for halt before the first instruction
+      stlink_soft_reset(sl, 1 /* halt on reset */);
+    }
   }
 
+connected:
   if(stlink_current_mode(sl) != STLINK_DEV_DEBUG_MODE &&
         stlink_enter_swd_mode(sl)) {
     printf("Failed to enter SWD mode\n");
@@ -1394,7 +1698,15 @@ int32_t stlink_target_connect(stlink_t *sl, enum connect_type connect) {
     stlink_reset(sl, RESET_AUTO);
   }
 
-  return stlink_load_device_params(sl);
+  if(stlink_load_device_params(sl) != 0) {
+    return (-1);
+  }
+
+  if(sl->chip_id == STM32_CHIPID_H5xx) {
+    stlink_h5_mark_attached(sl);
+  }
+
+  return (0);
 }
 
 // ==================================================
@@ -1408,4 +1720,3 @@ void stlink_run_at(stlink_t *sl, stm32_addr_t addr) {
     usleep(3000000);
   }
 }
-

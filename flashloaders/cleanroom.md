@@ -123,3 +123,31 @@ Copy one word each time. No wait for write.
 Copy one double word each time (More than one register is allowed).
 
 How to wait for the write process: read a half word from `FLASH_BSY`, loop until the busy bit is reset.
+
+## stm32h5.s
+
+Bank 1 registers:
+
+`FLASH_NSSR`: 0x40022020
+
+`FLASH_NSCR`: 0x40022028
+
+`FLASH_NSCCR`: 0x40022030
+
+Bank 2 registers:
+
+`FLASH_NSSR`: 0x50022020
+
+`FLASH_NSCR`: 0x50022028
+
+`FLASH_NSCCR`: 0x50022030
+
+**Special Requirements**:
+
+Copy one quadword each time (16 bytes, four 32-bit words).
+
+Use `r3` to select the bank-specific flash register block. Clear sticky status
+once before starting, wait for `BSY`, `WBNE`, and `DBNE` to clear, then keep
+`PG` set for the whole chunk. The loader should accept an exact byte count and
+pad the last quadword with `0xFF` locally. Clear `PG` and the sticky status
+bits once on exit.

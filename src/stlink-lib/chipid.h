@@ -20,6 +20,7 @@ struct stlink_chipid_params {
     uint32_t bootrom_size;
     uint32_t option_base;
     uint32_t option_size;
+    uint8_t target_ap;
     uint32_t flags;
     uint32_t otp_base;
     uint32_t otp_size;

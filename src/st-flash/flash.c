@@ -104,7 +104,6 @@ int32_t main(int32_t ac, char** av) {
     init_chipids (STLINK_CHIPS_DIR);
 
     sl = stlink_open_usb(o.log_level, o.connect, (char *)o.serial, o.freq);
-
     if(sl == NULL) { return (-1); }
 
     if(sl->flash_type == STM32_FLASH_TYPE_UNKNOWN) {

@@ -119,12 +119,14 @@ void process_chipfile(char *fname) {
         ts->flash_type = STM32_FLASH_TYPE_L0_L1;
       } else if(strcmp(value, "L4") == 0) {
         ts->flash_type = STM32_FLASH_TYPE_L4;
-      } else if(strcmp(value, "L5_U5_H5") == 0) {
-        ts->flash_type = STM32_FLASH_TYPE_L5_U5_H5;
+      } else if(strcmp(value, "L5_U5") == 0) {
+        ts->flash_type = STM32_FLASH_TYPE_L5_U5;
       } else if(strcmp(value, "WB_WL") == 0) {
         ts->flash_type = STM32_FLASH_TYPE_WB_WL;
       } else if(strcmp(value, "WB0") == 0) {
         ts->flash_type = STM32_FLASH_TYPE_WB0;
+      } else if(strcmp(value, "H5") == 0) {
+        ts->flash_type = STM32_FLASH_TYPE_H5;
       } else {
         ts->flash_type = STM32_FLASH_TYPE_UNKNOWN;
       }
@@ -169,6 +171,16 @@ void process_chipfile(char *fname) {
       sscanf(buf, "%*s %n", &nc);
       if(sscanf(value, "%i", &ts->option_size) < 1) {
         fprintf(stderr, "Failed to parse option size\n");
+      }
+    } else if(strcmp(word, "target_ap") == 0) {
+      int32_t target_ap;
+
+      buf[strlen(buf) - 1] = 0; // chomp newline
+      sscanf(buf, "%*s %n", &nc);
+      if(sscanf(value, "%i", &target_ap) < 1) {
+        fprintf(stderr, "Failed to parse target access port\n");
+      } else {
+        ts->target_ap = (uint8_t) target_ap;
       }
     } else if(strcmp(word, "flags") == 0) {
       buf[strlen(buf) - 1] = 0; // chomp newline

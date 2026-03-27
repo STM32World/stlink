@@ -11,8 +11,9 @@ XXDFLAGS = -i -c 4
 
 CFLAGS_ARMV6_M = -mcpu=Cortex-M0 -Tlinker.ld -ffreestanding -nostdlib
 CFLAGS_ARMV7_M = -mcpu=Cortex-M3 -Tlinker.ld -ffreestanding -nostdlib
+CFLAGS_ARMV8_M = -mcpu=Cortex-M33 -Tlinker.ld -ffreestanding -nostdlib
 
-all: stm32vl.h stm32f0.h stm32wb0.h stm32lx.h stm32f4.h stm32f4lv.h stm32l4.h stm32f7.h stm32f7lv.h
+all: stm32vl.h stm32f0.h stm32wb0.h stm32lx.h stm32f4.h stm32f4lv.h stm32l4.h stm32f7.h stm32f7lv.h stm32h5.h
 	
 
 %.h: %.bin
@@ -42,6 +43,9 @@ stm32lx.o: stm32lx.s
 # generic rule for all other ARMv7-M
 %.o: %.s
 	$(CC) $< $(CFLAGS_ARMV7_M) -o $@
+
+stm32h5.o: stm32h5.s
+	$(CC) stm32h5.s $(CFLAGS_ARMV8_M) -o stm32h5.o
 
 clean:
 	rm -f *.h

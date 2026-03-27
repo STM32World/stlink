@@ -31,6 +31,76 @@
 #include "read_write.h"
 #include "usb.h"
 
+#define STLINK_MEM_AP_CSW_CORTEX_M 0x23000000u
+static int32_t _stlink_usb_init_ap(stlink_t *sl);
+
+static bool stlink_h5_is_verify_read(const stlink_t *sl, uint32_t addr, uint16_t chunk) {
+    /*
+     * H5 verify uses 1 KiB flash reads over AP1. Skip per-block
+     * GETLASTRWSTATUS2 so the verify loop stays read-only.
+     */
+    return stlink_h5_uses_ap(sl) &&
+           sl->flash_size != 0 &&
+           chunk >= 1024 &&
+           addr >= sl->flash_base &&
+           addr < (sl->flash_base + sl->flash_size);
+}
+
+static void stlink_fill_enter_swd_ap_args(const stlink_t *sl, unsigned char *cmd, int32_t offset) {
+    if(!stlink_target_uses_ap(sl)) {
+        return;
+    }
+
+    memset(&cmd[offset], 0xff, 6);
+}
+
+static void stlink_fill_init_ap_args(const stlink_t *sl, unsigned char *cmd, int32_t offset) {
+    if(!stlink_target_uses_ap(sl)) {
+        return;
+    }
+
+    cmd[offset] = 0x01;
+}
+
+static void stlink_fill_native_ap_tail(const stlink_t *sl, unsigned char *cmd, int32_t offset) {
+    if(!stlink_target_uses_ap(sl)) {
+        return;
+    }
+
+    cmd[offset] = sl->target_ap;
+}
+
+static inline uint32_t stlink_mem_ap_csw(const stlink_t *sl) {
+    return sl->target_ap == 0 ? 0 : STLINK_MEM_AP_CSW_CORTEX_M;
+}
+
+static inline void stlink_set_mem_ap_trailer(unsigned char *cmd, int32_t offset,
+                                             const stlink_t *sl) {
+    const uint32_t csw = stlink_mem_ap_csw(sl) >> 8;
+    cmd[offset] = sl->target_ap;
+    cmd[offset + 1] = csw & 0xff;
+    cmd[offset + 2] = (csw >> 8) & 0xff;
+    cmd[offset + 3] = (csw >> 16) & 0xff;
+}
+
+static inline uint16_t stlink_mem32_chunk_size(const stlink_t *sl, uint32_t addr,
+                                               uint16_t len, uint16_t max_chunk) {
+    uint16_t chunk = len > max_chunk ? max_chunk : len;
+
+    if(stlink_target_uses_ap(sl)) {
+        uint16_t boundary = (uint16_t) (1024u - (addr & 0x3ffu));
+        if(boundary != 0 && chunk > boundary) {
+            chunk = boundary;
+        }
+    }
+
+    return chunk;
+}
+
+static inline bool stlink_use_debug_access_router(const stlink_t *sl) {
+    return stlink_target_uses_ap(sl);
+}
+
 static inline uint32_t le_to_h_u32(const uint8_t* buf) {
     return ((uint32_t) ((uint32_t) buf[0] | (uint32_t) buf[1] << 8 | (uint32_t) buf[2] << 16 | (uint32_t) buf[3] << 24));
 }
@@ -114,7 +184,6 @@ ssize_t send_recv(struct stlink_libusb* handle, int32_t terminate, unsigned char
                 ELOG("%s read reply failed: %s\n", cmd, libusb_error_name(t));
                 return (-1);
             }
-
             /* Checking the command execution status stored in the first byte of the response */
             if(handle->protocol != 1 && check_error >= CMD_CHECK_STATUS && 
                         rxbuf[0] != STLINK_DEBUG_ERR_OK) {
@@ -162,7 +231,6 @@ ssize_t send_recv(struct stlink_libusb* handle, int32_t terminate, unsigned char
             // The STLink doesn't seem to evaluate the sequence number.
             handle->sg_transfer_idx++;
         }
-
         return (res);
     }
 }
@@ -255,11 +323,17 @@ int32_t _stlink_usb_read_debug32(stlink_t *sl, uint32_t addr, uint32_t *data) {
     unsigned char* const cmd  = sl->c_buf;
     ssize_t size;
     const int32_t rep_len = 8;
+    int32_t i;
 
-    int32_t i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
+    if(_stlink_usb_init_ap(sl) == -1) {
+        return (-1);
+    }
+
+    i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
     cmd[i++] = STLINK_DEBUG_COMMAND;
     cmd[i++] = STLINK_DEBUG_APIV2_READDEBUGREG;
     write_uint32(&cmd[i], addr);
+    stlink_fill_native_ap_tail(sl, cmd, i + 4);
     size = send_recv(slu, 1, cmd, slu->cmd_len, rdata, rep_len, CMD_CHECK_RETRY, "READDEBUGREG");
 
     if(size < 0) {
@@ -267,7 +341,6 @@ int32_t _stlink_usb_read_debug32(stlink_t *sl, uint32_t addr, uint32_t *data) {
     }
 
     *data = read_uint32(rdata, 4);
-
     return (0);
 }
 
@@ -277,12 +350,18 @@ int32_t _stlink_usb_write_debug32(stlink_t *sl, uint32_t addr, uint32_t data) {
     unsigned char* const cmd  = sl->c_buf;
     ssize_t size;
     const int32_t rep_len = 2;
+    int32_t i;
 
-    int32_t i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
+    if(_stlink_usb_init_ap(sl) == -1) {
+        return (-1);
+    }
+
+    i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
     cmd[i++] = STLINK_DEBUG_COMMAND;
     cmd[i++] = STLINK_DEBUG_APIV2_WRITEDEBUGREG;
     write_uint32(&cmd[i], addr);
     write_uint32(&cmd[i + 4], data);
+    stlink_fill_native_ap_tail(sl, cmd, i + 8);
     size = send_recv(slu, 1, cmd, slu->cmd_len, rdata, rep_len, CMD_CHECK_RETRY, "WRITEDEBUGREG");
 
     return (size < 0 ? -1 : 0);
@@ -311,26 +390,75 @@ int32_t _stlink_usb_get_rw_status(stlink_t *sl) {
     return (ret < 0 ? -1 : 0);
 }
 
+static int32_t _stlink_usb_init_ap(stlink_t *sl) {
+    struct stlink_libusb * const slu = sl->backend_data;
+    unsigned char* const rdata = sl->q_buf;
+    unsigned char* const cmd  = sl->c_buf;
+    ssize_t size;
+    int32_t i;
+
+    if(sl->version.jtag_api == STLINK_JTAG_API_V1 ||
+        sl->target_ap == 0 ||
+        sl->target_ap_inited) {
+        return (0);
+    }
+
+    if(!(sl->version.flags & STLINK_F_HAS_AP_INIT) ||
+        !(sl->version.flags & STLINK_F_HAS_DPBANKSEL)) {
+        ELOG("ST-Link firmware does not support selecting access port %u\n", sl->target_ap);
+        return (-1);
+    }
+
+    i = fill_command(sl, SG_DXFER_FROM_DEV, 2);
+    cmd[i++] = STLINK_DEBUG_COMMAND;
+    cmd[i++] = STLINK_DEBUG_APIV2_INIT_AP;
+    cmd[i++] = sl->target_ap;
+    stlink_fill_init_ap_args(sl, cmd, i);
+    size = send_recv(slu, 1, cmd, slu->cmd_len, rdata, 2, CMD_CHECK_STATUS, "INIT_AP");
+
+    if(size < 0) {
+        return (-1);
+    }
+
+    sl->target_ap_inited = true;
+    return (0);
+}
+
 int32_t _stlink_usb_write_mem32(stlink_t *sl, uint32_t addr, uint16_t len) {
     struct stlink_libusb * const slu = sl->backend_data;
     unsigned char* const data = sl->q_buf;
     unsigned char* const cmd  = sl->c_buf;
     int32_t i, ret;
+    uint16_t off = 0;
+    const uint16_t max_chunk = stlink_target_uses_ap(sl) ? 1024 : len;
 
-    i = fill_command(sl, SG_DXFER_TO_DEV, len);
-    cmd[i++] = STLINK_DEBUG_COMMAND;
-    cmd[i++] = STLINK_DEBUG_WRITEMEM_32BIT;
-    write_uint32(&cmd[i], addr);
-    write_uint16(&cmd[i + 4], len);
-    ret = send_only(slu, 0, cmd, slu->cmd_len, "WRITEMEM_32BIT");
-
+    ret = _stlink_usb_init_ap(sl);
     if(ret == -1) { return (ret); }
 
-    ret = send_only(slu, 1, data, len, "WRITEMEM_32BIT");
+    while(off < len) {
+        uint16_t chunk = stlink_mem32_chunk_size(sl, addr + off, len - off, max_chunk);
 
-    if(ret == -1) { return (ret); }
+        i = fill_command(sl, SG_DXFER_TO_DEV, chunk);
+        cmd[i++] = STLINK_DEBUG_COMMAND;
+        cmd[i++] = STLINK_DEBUG_WRITEMEM_32BIT;
+        write_uint32(&cmd[i], addr + off);
+        write_uint16(&cmd[i + 4], chunk);
+        stlink_set_mem_ap_trailer(cmd, i + 6, sl);
+        ret = send_only(slu, 0, cmd, slu->cmd_len, "WRITEMEM_32BIT");
 
-    return (_stlink_usb_get_rw_status(sl));
+        if(ret == -1) { return (ret); }
+
+        ret = send_only(slu, 1, data + off, chunk, "WRITEMEM_32BIT");
+
+        if(ret == -1) { return (ret); }
+
+        ret = _stlink_usb_get_rw_status(sl);
+        if(ret == -1) { return (ret); }
+
+        off += chunk;
+    }
+
+    return (0);
 }
 
 int32_t _stlink_usb_write_mem8(stlink_t *sl, uint32_t addr, uint16_t len) {
@@ -345,11 +473,15 @@ int32_t _stlink_usb_write_mem8(stlink_t *sl, uint32_t addr, uint16_t len) {
         return (-1);
     }
 
+    ret = _stlink_usb_init_ap(sl);
+    if(ret == -1) { return (ret); }
+
     i = fill_command(sl, SG_DXFER_TO_DEV, 0);
     cmd[i++] = STLINK_DEBUG_COMMAND;
     cmd[i++] = STLINK_DEBUG_WRITEMEM_8BIT;
     write_uint32(&cmd[i], addr);
     write_uint16(&cmd[i + 4], len);
+    stlink_set_mem_ap_trailer(cmd, i + 6, sl);
     ret = send_only(slu, 0, cmd, slu->cmd_len, "WRITEMEM_8BIT");
 
     if(ret == -1) { return (ret); }
@@ -412,14 +544,26 @@ int32_t _stlink_usb_status_v2(stlink_t *sl) {
     int32_t result;
     uint32_t status = 0;
 
-    result = _stlink_usb_read_debug32(sl, STM32_REG_DHCSR, &status);
+    if(stlink_use_debug_access_router(sl)) {
+        result = stlink_read_debug32(sl, STM32_REG_DHCSR, &status);
+        if(result != 0 && sl->chip_id == STM32_CHIPID_H5xx && sl->target_ap != 0) {
+            if(_stlink_usb_read_mem32(sl, STM32_REG_DHCSR, 4) == 0) {
+                status = read_uint32(sl->q_buf, 0);
+                result = 0;
+            }
+        }
+    } else {
+        result = _stlink_usb_read_debug32(sl, STM32_REG_DHCSR, &status);
+    }
     DLOG("core status: %08X\n", status);
 
     if(result != 0) {
         sl->core_stat = TARGET_UNKNOWN;
     } else {
-        if(status & STM32_REG_DHCSR_C_HALT) {
+        if(status & STM32_REG_DHCSR_S_HALT) {
             sl->core_stat = TARGET_HALTED;
+        } else if(status & STM32_REG_DHCSR_S_LOCKUP) {
+            sl->core_stat = TARGET_UNKNOWN;
         } else if(status & STM32_REG_DHCSR_S_RESET_ST) {
             sl->core_stat = TARGET_RESET;
         } else {
@@ -466,7 +610,17 @@ int32_t _stlink_usb_force_debug(stlink_t *sl) {
     int32_t res;
 
     if(sl->version.jtag_api != STLINK_JTAG_API_V1) {
-        res = _stlink_usb_write_debug32(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_HALT | STM32_REG_DHCSR_C_DEBUGEN);
+        if(stlink_use_debug_access_router(sl)) {
+            res = stlink_write_debug32(sl, STM32_REG_DHCSR,
+                                       STM32_REG_DHCSR_DBGKEY |
+                                       STM32_REG_DHCSR_C_HALT |
+                                       STM32_REG_DHCSR_C_DEBUGEN);
+        } else {
+            res = _stlink_usb_write_debug32(sl, STM32_REG_DHCSR,
+                                            STM32_REG_DHCSR_DBGKEY |
+                                            STM32_REG_DHCSR_C_HALT |
+                                            STM32_REG_DHCSR_C_DEBUGEN);
+        }
         return (res);
     }
 
@@ -503,7 +657,12 @@ int32_t _stlink_usb_enter_swd_mode(stlink_t * sl) {
     }
 
     cmd[i++] = STLINK_DEBUG_ENTER_SWD;
+    stlink_fill_enter_swd_ap_args(sl, cmd, i);
     size = send_recv(slu, 1, cmd, slu->cmd_len, data, rep_len, CMD_CHECK_RETRY, "ENTER_SWD");
+
+    if(size >= 0 && !stlink_h5_uses_ap(sl)) {
+        stlink_invalidate_ap_session(sl);
+    }
 
     return (size < 0 ? -1 : 0);
 }
@@ -544,6 +703,10 @@ int32_t _stlink_usb_reset(stlink_t * sl) {
 
     size = send_recv(slu, 1, cmd, slu->cmd_len, data, rep_len, CMD_CHECK_RETRY, "RESETSYS");
 
+    if(size >= 0 && !stlink_h5_uses_ap(sl)) {
+        stlink_invalidate_ap_session(sl);
+    }
+
     return (size < 0 ? -1 : 0);
 }
 
@@ -560,6 +723,10 @@ int32_t _stlink_usb_jtag_reset(stlink_t * sl, int32_t value) {
     cmd[i++] = value;
     size = send_recv(slu, 1, cmd, slu->cmd_len, data, rep_len, CMD_CHECK_RETRY, "DRIVE_NRST");
 
+    if(size >= 0 && !stlink_h5_uses_ap(sl)) {
+        stlink_invalidate_ap_session(sl);
+    }
+
     return (size < 0 ? -1 : 0);
 }
 
@@ -569,12 +736,14 @@ int32_t _stlink_usb_step(stlink_t* sl) {
 
     if(sl->version.jtag_api != STLINK_JTAG_API_V1) {
         // emulates the JTAG v1 API by using DHCSR
-        _stlink_usb_write_debug32(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_HALT |
-                                                        STM32_REG_DHCSR_C_MASKINTS | STM32_REG_DHCSR_C_DEBUGEN);
-        _stlink_usb_write_debug32(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_STEP |
-                                                        STM32_REG_DHCSR_C_MASKINTS | STM32_REG_DHCSR_C_DEBUGEN);
-        return _stlink_usb_write_debug32(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_HALT |
-                                                               STM32_REG_DHCSR_C_DEBUGEN);
+        int32_t (*write_debug32_fn)(stlink_t *, uint32_t, uint32_t) =
+            stlink_use_debug_access_router(sl) ? stlink_write_debug32 : _stlink_usb_write_debug32;
+        write_debug32_fn(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_HALT |
+                                              STM32_REG_DHCSR_C_MASKINTS | STM32_REG_DHCSR_C_DEBUGEN);
+        write_debug32_fn(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_STEP |
+                                              STM32_REG_DHCSR_C_MASKINTS | STM32_REG_DHCSR_C_DEBUGEN);
+        return write_debug32_fn(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_HALT |
+                                                     STM32_REG_DHCSR_C_DEBUGEN);
     }
 
     unsigned char* const data = sl->q_buf;
@@ -601,8 +770,21 @@ int32_t _stlink_usb_run(stlink_t* sl, enum run_type type) {
     int32_t res;
 
     if(sl->version.jtag_api != STLINK_JTAG_API_V1) {
-        res = _stlink_usb_write_debug32(sl, STM32_REG_DHCSR, STM32_REG_DHCSR_DBGKEY | STM32_REG_DHCSR_C_DEBUGEN |
-                    ((type==RUN_FLASH_LOADER)?STM32_REG_DHCSR_C_MASKINTS:0));
+        if(stlink_use_debug_access_router(sl)) {
+            res = stlink_write_debug32(sl, STM32_REG_DHCSR,
+                                       STM32_REG_DHCSR_DBGKEY |
+                                       STM32_REG_DHCSR_C_DEBUGEN |
+                                       ((type == RUN_FLASH_LOADER) ?
+                                           STM32_REG_DHCSR_C_MASKINTS :
+                                           0));
+        } else {
+            res = _stlink_usb_write_debug32(sl, STM32_REG_DHCSR,
+                                            STM32_REG_DHCSR_DBGKEY |
+                                            STM32_REG_DHCSR_C_DEBUGEN |
+                                            ((type == RUN_FLASH_LOADER) ?
+                                                STM32_REG_DHCSR_C_MASKINTS :
+                                                0));
+        }
         return (res);
     }
 
@@ -719,6 +901,10 @@ int32_t _stlink_usb_exit_debug_mode(stlink_t *sl) {
 
     size = send_only(slu, 1, cmd, slu->cmd_len, "DEBUG_EXIT");
 
+    if(size >= 0 && !stlink_h5_uses_ap(sl)) {
+        stlink_invalidate_ap_session(sl);
+    }
+
     return (size < 0 ? -1 : 0);
 }
 
@@ -727,19 +913,41 @@ int32_t _stlink_usb_read_mem32(stlink_t *sl, uint32_t addr, uint16_t len) {
     unsigned char* const data = sl->q_buf;
     unsigned char* const cmd = sl->c_buf;
     ssize_t size;
-    int32_t i = fill_command(sl, SG_DXFER_FROM_DEV, len);
+    int32_t ret;
+    int32_t i;
+    uint16_t off = 0;
+    const uint16_t max_chunk = stlink_target_uses_ap(sl) ? 1024 : len;
 
-    cmd[i++] = STLINK_DEBUG_COMMAND;
-    cmd[i++] = STLINK_DEBUG_READMEM_32BIT;
-    write_uint32(&cmd[i], addr);
-    write_uint16(&cmd[i + 4], len);
-    size = send_recv(slu, 1, cmd, slu->cmd_len, data, len, CMD_CHECK_NO, "READMEM_32BIT");
+    ret = _stlink_usb_init_ap(sl);
+    if(ret == -1) { return (ret); }
 
-    if(size < 0) {
-        return (-1);
+    while(off < len) {
+        uint16_t chunk = stlink_mem32_chunk_size(sl, addr + off, len - off, max_chunk);
+
+        i = fill_command(sl, SG_DXFER_FROM_DEV, chunk);
+
+        cmd[i++] = STLINK_DEBUG_COMMAND;
+        cmd[i++] = STLINK_DEBUG_READMEM_32BIT;
+        write_uint32(&cmd[i], addr + off);
+        write_uint16(&cmd[i + 4], chunk);
+        stlink_set_mem_ap_trailer(cmd, i + 6, sl);
+        size = send_recv(slu, 1, cmd, slu->cmd_len, data + off, chunk, CMD_CHECK_NO, "READMEM_32BIT");
+
+        if(size < 0) {
+            return (-1);
+        }
+
+        if(chunk > 4 && !stlink_h5_is_verify_read(sl, addr + off, chunk)) {
+            ret = _stlink_usb_get_rw_status(sl);
+            if(ret == -1) {
+                return (-1);
+            }
+        }
+
+        off += chunk;
     }
 
-    sl->q_len = (int32_t) size;
+    sl->q_len = len;
     stlink_print_data(sl);
 
     return (0);
@@ -805,6 +1013,12 @@ int32_t _stlink_usb_read_reg(stlink_t *sl, int32_t r_idx, struct stlink_reg *reg
     int32_t reg_offset = sl->version.jtag_api == STLINK_JTAG_API_V1 ? 0 : 4;
     int32_t i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
 
+    if(_stlink_usb_init_ap(sl) == -1) {
+        return (-1);
+    }
+
+    i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
+
     cmd[i++] = STLINK_DEBUG_COMMAND;
 
     if(sl->version.jtag_api == STLINK_JTAG_API_V1) {
@@ -817,6 +1031,7 @@ int32_t _stlink_usb_read_reg(stlink_t *sl, int32_t r_idx, struct stlink_reg *reg
     }
 
     cmd[i++] = (uint8_t) r_idx;
+    stlink_fill_native_ap_tail(sl, cmd, i);
     size = send_recv(slu, 1, cmd, slu->cmd_len, data, rep_len, CMD_CHECK_RETRY, "READREG");
 
     if(size < 0) {
@@ -973,6 +1188,12 @@ int32_t _stlink_usb_write_reg(stlink_t *sl, uint32_t reg, int32_t idx) {
     uint32_t rep_len = 2;
     int32_t i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
 
+    if(_stlink_usb_init_ap(sl) == -1) {
+        return (-1);
+    }
+
+    i = fill_command(sl, SG_DXFER_FROM_DEV, rep_len);
+
     cmd[i++] = STLINK_DEBUG_COMMAND;
 
     if(sl->version.jtag_api == STLINK_JTAG_API_V1) {
@@ -986,6 +1207,7 @@ int32_t _stlink_usb_write_reg(stlink_t *sl, uint32_t reg, int32_t idx) {
 
     cmd[i++] = idx;
     write_uint32(&cmd[i], reg);
+    stlink_fill_native_ap_tail(sl, cmd, i + 4);
     size = send_recv(slu, 1, cmd, slu->cmd_len, data, rep_len, CMD_CHECK_RETRY, "WRITEREG");
 
     return (size < 0 ? -1 : 0);
@@ -1148,7 +1370,8 @@ uint32_t stlink_serial(struct libusb_device_handle *handle, struct libusb_device
  * @retval NULL   Error while opening the stlink
  * @retval !NULL  Stlink found and ready to use
  */
-stlink_t *stlink_open_usb(enum ugly_loglevel verbose, enum connect_type connect, char serial[STLINK_SERIAL_BUFFER_SIZE], int32_t freq) {
+stlink_t *stlink_open_usb(enum ugly_loglevel verbose, enum connect_type connect,
+                          char serial[STLINK_SERIAL_BUFFER_SIZE], int32_t freq) {
     stlink_t* sl = NULL;
     struct stlink_libusb* slu = NULL;
     int32_t ret = -1;

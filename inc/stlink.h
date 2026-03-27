@@ -79,7 +79,6 @@ enum target_state {
 #define STLINK_F_HAS_JTAG_SET_FREQ      (1 << 2)
 #define STLINK_F_HAS_MEM_16BIT          (1 << 3)
 #define STLINK_F_HAS_GETLASTRWSTATUS2   (1 << 4)
-#define STLINK_F_HAS_DAP_REG            (1 << 5)
 #define STLINK_F_QUIRK_JTAG_DP_READ     (1 << 6)
 #define STLINK_F_HAS_AP_INIT            (1 << 7)
 #define STLINK_F_HAS_DPBANKSEL          (1 << 8)
@@ -222,6 +221,11 @@ struct _stlink {
     /* option settings */
     stm32_addr_t option_base;
     uint32_t option_size;
+    uint8_t target_ap;
+    bool target_ap_inited;
+    bool h5_ap1_mode;
+    bool h5_native_debug_regs;
+    bool h5_native_core_regs;
 
     // bootloader
     // sys_base and sys_size are not used by the tools, but are only there to download the bootloader code
@@ -238,6 +242,20 @@ struct _stlink {
     uint32_t otp_base;
     uint32_t otp_size;
 };
+
+static inline bool stlink_target_uses_ap(const stlink_t *sl) {
+    return sl->target_ap != 0;
+}
+
+static inline bool stlink_h5_uses_ap(const stlink_t *sl) {
+    return sl->chip_id == STM32_CHIPID_H5xx && stlink_target_uses_ap(sl);
+}
+
+static inline void stlink_invalidate_ap_session(stlink_t *sl) {
+    if(stlink_target_uses_ap(sl)) {
+        sl->target_ap_inited = false;
+    }
+}
 
 
 /* === Declaration of functions defined in common_legacy.c === */

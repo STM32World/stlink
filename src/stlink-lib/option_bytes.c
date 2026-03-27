@@ -758,15 +758,15 @@ static int32_t stlink_write_option_bytes_wb(stlink_t *sl, stm32_addr_t addr, uin
 }
 
 /**
- * Write option bytes L5
+ * Write option bytes L5/U5
  * @param sl
  * @param addr of the memory mapped option bytes
  * @param base option bytes
  * @param len of option bytes
  * @return 0 on success, -ve on failure.
  */
-static int32_t stlink_write_option_bytes_l5(stlink_t *sl, stm32_addr_t addr,
-                                            uint8_t *base, uint32_t len) {
+static int32_t stlink_write_option_bytes_l5_u5(stlink_t *sl, stm32_addr_t addr,
+                                               uint8_t *base, uint32_t len) {
   /* Write options bytes */
   uint32_t val;
   int32_t ret = 0;
@@ -932,8 +932,11 @@ int32_t stlink_write_option_bytes(stlink_t *sl, stm32_addr_t addr, uint8_t *base
   case STM32_FLASH_TYPE_WB_WL:
     ret = stlink_write_option_bytes_wb(sl, addr, base, len);
     break;
-  case STM32_FLASH_TYPE_L5_U5_H5:
-    ret = stlink_write_option_bytes_l5(sl, addr, base, len);
+  case STM32_FLASH_TYPE_L5_U5:
+    ret = stlink_write_option_bytes_l5_u5(sl, addr, base, len);
+    break;
+  case STM32_FLASH_TYPE_H5:
+    ELOG("Option bytes writing is currently not implemented for STM32H5\n");
     break;
   default:
     ELOG("Option bytes writing is currently not implemented for connected chip\n");
